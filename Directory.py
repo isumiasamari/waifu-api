@@ -14,6 +14,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import edge_tts
+from edge_tts.exceptions import NoAudioReceived
+from fastapi import HTTPException
 
 # ---------------------- 配置和调试信息 ----------------------
 print("=" * 50)
@@ -150,12 +152,36 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
 # ---------------------- Edge-TTS 生成 ----------------------
 async def synthesize_tts(text: str, voice: str = "zh-CN-XiaoyouNeural") -> Path:
     async with tts_lock:
+        # 确保目录存在（Render 这种云环境默认是没有这个目录的）
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
         timestamp = int(time.time() * 1000)
         filename = f"reply_{timestamp}.mp3"
         dest = AUDIO_DIR / filename
+
         communicate = edge_tts.Communicate(text=text, voice=voice)
-        await communicate.save(str(dest))
-        (dest.with_suffix(".mp3.meta")).write_text(json.dumps({"created": datetime.utcnow().isoformat()}))
+
+        try:
+            # 这里如果云端拿不到音频，就会抛 NoAudioReceived
+            await communicate.save(str(dest))
+        except NoAudioReceived:
+            # 不要让整个接口 500，改成 503 + 友好提示
+            raise HTTPException(
+                status_code=503,
+                detail="TTS 服务没有返回音频（云端可能被限制了），先用文字吧。"
+            )
+        except Exception as e:
+            # 兜底异常，方便以后排查
+            raise HTTPException(
+                status_code=500,
+                detail=f"TTS 生成失败: {e}"
+            )
+
+        # 只有成功生成音频时才写 meta
+        (dest.with_suffix(".mp3.meta")).write_text(
+            json.dumps({"created": datetime.utcnow().isoformat()})
+        )
+
         return dest
 
 
