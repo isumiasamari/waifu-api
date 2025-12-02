@@ -80,10 +80,15 @@ async def story_loop():
 
     while state["story_mode"]["enabled"]:
         try:
-            memory = state["story_mode"]["story_memory"][-10:]
+            # 1. 把 story_memory 里的 dict 转成字符串形式，跟普通聊天一致
+            memory_items = state["story_mode"]["story_memory"][-10:]
+            recent_memory = [f"{m['role']}: {m['text']}" for m in memory_items]
+
+            # 2. 给 LLM 的“用户消息”就是“续写刚才的故事”
             prompt = "续写刚才的故事，继续讲下一段，保持连贯，至少 120 字。"
 
-            reply = await call_llm_api(prompt, memory)
+            # 3. 把 recent_memory 传进去
+            reply = await call_llm_api(prompt, recent_memory)
 
             state["story_mode"]["story_memory"].append(
                 {"role": "assistant", "text": reply}
@@ -129,6 +134,10 @@ security = HTTPBearer(auto_error=False)
 # 在 FastAPI 中保存故事任务，不要用 global
 app.state.story_task = None
 
+from pydantic import BaseModel
+
+class StoryChunk(BaseModel):
+    text: str
 
 # ---------------------- 数据模型 ----------------------
 class ChatRequest(BaseModel):
@@ -147,6 +156,14 @@ async def check_auth(credentials: HTTPAuthorizationCredentials = Depends(securit
     if credentials.credentials != APP_API_TOKEN:
         raise HTTPException(401, "Invalid token")
     return True
+
+@app.get("/story/latest", response_model=StoryChunk)
+async def get_latest_story(auth: bool = Depends(check_auth)):
+    story = state.get("story_mode", {}).get("story_memory", [])
+    if not story:
+        raise HTTPException(404, "还没有故事哦~")
+    # 返回最后一段故事文本
+    return StoryChunk(text=story[-1]["text"])
 
 
 # ---------------------- 调用 DeepSeek ----------------------
