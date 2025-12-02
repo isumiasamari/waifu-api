@@ -80,14 +80,21 @@ async def story_loop():
 
     while state["story_mode"]["enabled"]:
         try:
-            # 1. 把 story_memory 里的 dict 转成字符串形式，跟普通聊天一致
-            memory_items = state["story_mode"]["story_memory"][-10:]
-            recent_memory = [f"{m['role']}: {m['text']}" for m in memory_items]
+            # 最近 10 段故事（可能是 dict，也可能历史数据是字符串）
+            history = state.get("story_mode", {}).get("story_memory", [])[-10:]
 
-            # 2. 给 LLM 的“用户消息”就是“续写刚才的故事”
+            recent_memory = []
+            for item in history:
+                if isinstance(item, dict):
+                    role = item.get("role", "assistant")
+                    text = item.get("text", "")
+                    recent_memory.append(f"{role}: {text}")
+                else:
+                    # 老数据如果不是 dict，直接转成字符串
+                    recent_memory.append(str(item))
+
             prompt = "续写刚才的故事，继续讲下一段，保持连贯，至少 120 字。"
 
-            # 3. 把 recent_memory 传进去
             reply = await call_llm_api(prompt, recent_memory)
 
             state["story_mode"]["story_memory"].append(
