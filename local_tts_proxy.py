@@ -11,6 +11,9 @@ app = FastAPI(title="Local TTS Proxy (edge_tts)")
 
 class TtsProxyRequest(BaseModel):
     text: str
+    voice: str = "zh-CN-XiaoyiNeural"
+    rate: str = "-5%"
+    pitch: str = "+30Hz"
 
 tts_lock = asyncio.Lock()
 
@@ -34,7 +37,9 @@ async def tts_proxy(req: TtsProxyRequest):
             # 2. 调用 edge_tts 生成语音
             communicate = edge_tts.Communicate(
                 text=text,
-                voice="zh-CN-XiaoyouNeural"   # 你原来用的音色
+                voice=req.voice,
+                rate=req.rate,
+                pitch=req.pitch
             )
             await communicate.save(tmp_path)
 
