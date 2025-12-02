@@ -125,8 +125,9 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
         print("❌ LLM 客户端未初始化")
         return "抱歉，AI 服务暂时不可用。请检查 API 密钥配置。"
 
-    system_prompt = f""" 设定：你是麻毬，是主人的专属老婆。
-           """
+    system_prompt = f"""设定：你是麻毬
+
+        回复必须超过100字，尽量详细、丰富，连贯自然。"""
 
     try:
         print(f"🔍 准备调用 DeepSeek API，用户消息长度: {len(user_message)}")
@@ -153,7 +154,12 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
 
 
 # ---------------------- Edge-TTS 生成 ----------------------
-async def synthesize_tts(text: str, voice: str = "zh-CN-XiaoyiNeural") -> Path:
+async def synthesize_tts(
+        text: str,
+        voice: str = "zh-CN-XiaoyiNeural",
+        rate: str = "-5%",
+        pitch: str = "+30Hz"
+) -> Path:
     """
     优先走 TTS 代理（你的电脑），如果没配置 TTS_PROXY_URL，就退回本地 edge_tts（方便你在本机跑）
     """
@@ -168,7 +174,12 @@ async def synthesize_tts(text: str, voice: str = "zh-CN-XiaoyiNeural") -> Path:
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(
                         TTS_PROXY_URL,
-                        json={"text": text},
+                        json={
+                            "text": text,
+                            "voice": voice,
+                            "rate": rate,
+                            "pitch": pitch
+                        },
                     )
 
                 if resp.status_code != 200:
@@ -228,7 +239,7 @@ async def chat_endpoint(
     state["memory"] = state["memory"][-MAX_MEMORY:]
     save_state()
 
-    recent_memory = [f"{m['role']}: {m['text']}" for m in state["memory"][-10:]]
+    recent_memory = [f"{m['role']}: {m['text']}" for m in state["memory"][-20:]]
     reply_text = await call_llm_api(req.message, recent_memory)
     state["memory"].append({"role": "assistant", "text": reply_text, "ts": datetime.utcnow().isoformat()})
     save_state()
@@ -236,7 +247,12 @@ async def chat_endpoint(
     # 后台生成 TTS
     async def gen_tts():
         try:
-            await synthesize_tts(reply_text)
+            await synthesize_tts(
+                reply_text,
+                voice="zh-CN-XiaoyiNeural",
+                rate="-5%",
+                pitch="+30Hz"
+            )
         except Exception as e:
             print("TTS failed:", e)
 
