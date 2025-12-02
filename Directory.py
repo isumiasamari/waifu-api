@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import edge_tts
+from contextlib import asynccontextmanager
 
 # ---------------------- 启动日志 ----------------------
 print("=" * 50)
@@ -51,34 +52,15 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 tts_lock = asyncio.Lock()
 
-# ---------------------- FastAPI ----------------------
-app = FastAPI(
-    title="Waifu Backend",
-    lifespan=lifespan
-)
-security = HTTPBearer(auto_error=False)
-
-# 在 FastAPI 中保存故事任务，不要用 global
-app.state.story_task = None
-
-# ---------------------- 数据模型 ----------------------
-class ChatRequest(BaseModel):
-    user_id: Optional[str] = "default_user"
-    message: str
-
-class ChatResponse(BaseModel):
-    reply: str
-    tts_url: Optional[str] = None
-
 # ---------------------- 全局状态 ----------------------
 state = {
     "character": {"name": "麻毬", "age": 18, "seikaku": "温柔"},
     "memory": [],
     "story_mode": {
-    "enabled": False,
-    "last_reply": None,
-    "last_time": None,
-    "story_memory": []   # ★ 必须加
+        "enabled": False,
+        "last_reply": None,
+        "last_time": None,
+        "story_memory": []
     }
 }
 
@@ -91,6 +73,73 @@ if STATE_FILE.exists():
 def save_state():
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
+# ---------------------- 自动讲故事后台任务 ----------------------
+async def story_loop():
+    print("📚【故事模式】后台任务启动")
+
+    while state["story_mode"]["enabled"]:
+        try:
+            memory = state["story_mode"]["story_memory"][-10:]
+            prompt = "续写刚才的故事，继续讲下一段，保持连贯，至少 120 字。"
+
+            reply = await call_llm_api(prompt, memory)
+
+            state["story_mode"]["story_memory"].append(
+                {"role": "assistant", "text": reply}
+            )
+            save_state()
+
+            await synthesize_tts(
+                reply,
+                voice="zh-CN-XiaoyiNeural",
+                rate="-5%",
+                pitch="+30Hz"
+            )
+
+            print("📚【故事模式】已生成下一段")
+
+        except Exception as e:
+            print("❌ 故事生成失败：", e)
+
+        await asyncio.sleep(60)
+
+    print("📕【故事模式】后台任务结束")
+
+
+# ---------------------- lifespan 必须写在 app 之前 ----------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 Backend Starting...")
+    if state["story_mode"]["enabled"]:
+        print("📚 检测到故事模式开启，自动恢复任务")
+        app.state.story_task = asyncio.create_task(story_loop())
+    yield
+    print("🛑 Backend Stopping...")
+
+
+# ---------------------- FastAPI（唯一的 app） ----------------------
+app = FastAPI(
+    title="Waifu Backend",
+    lifespan=lifespan
+)
+
+security = HTTPBearer(auto_error=False)
+
+# 在 FastAPI 中保存故事任务，不要用 global
+app.state.story_task = None
+
+
+# ---------------------- 数据模型 ----------------------
+class ChatRequest(BaseModel):
+    user_id: Optional[str] = "default_user"
+    message: str
+
+class ChatResponse(BaseModel):
+    reply: str
+    tts_url: Optional[str] = None
+
+
 # ---------------------- 鉴权 ----------------------
 async def check_auth(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials:
@@ -98,6 +147,7 @@ async def check_auth(credentials: HTTPAuthorizationCredentials = Depends(securit
     if credentials.credentials != APP_API_TOKEN:
         raise HTTPException(401, "Invalid token")
     return True
+
 
 # ---------------------- 调用 DeepSeek ----------------------
 async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
@@ -123,6 +173,8 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
     except Exception as e:
         print("❌ LLM 调用失败:", e)
         return "抱歉，我有点头晕……先休息一下~"
+
+
 # ---------------------- Edge-TTS 生成 ----------------------
 async def synthesize_tts(
         text: str,
@@ -135,81 +187,38 @@ async def synthesize_tts(
         filename = f"reply_{timestamp}.mp3"
         dest = AUDIO_DIR / filename
 
-        # -------- 优先调用 TTS 代理（你的本地电脑）--------
         if TTS_PROXY_URL:
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    resp = await client.post(
-                        TTS_PROXY_URL,
-                        json={
-                            "text": text,
-                            "voice": voice,
-                            "rate": rate,
-                            "pitch": pitch
-                        },
-                    )
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    TTS_PROXY_URL,
+                    json={
+                        "text": text,
+                        "voice": voice,
+                        "rate": rate,
+                        "pitch": pitch
+                    },
+                )
 
-                if resp.status_code != 200:
-                    raise RuntimeError(f"TTS 代理失败: {resp.text[:200]}")
+            if resp.status_code != 200:
+                raise RuntimeError(f"TTS 代理失败: {resp.text[:200]}")
 
-                dest.write_bytes(resp.content)
-
-            except Exception as e:
-                raise HTTPException(503, f"TTS 代理失败: {e}")
+            dest.write_bytes(resp.content)
 
         else:
-            # -------- Fallback：云端自己生成（不推荐）--------
             communicate = edge_tts.Communicate(
                 text=text,
                 voice=voice,
                 rate=rate,
-                pitch=pitch,
+                pitch=pitch
             )
             await communicate.save(str(dest))
 
-        # meta 信息
         (dest.with_suffix(".mp3.meta")).write_text(
             json.dumps({"created": datetime.utcnow().isoformat()})
         )
         return dest
 
 
-# ---------------------- 自动讲故事后台任务 ----------------------
-async def story_loop():
-    """
-    自动讲故事循环：
-    - 每 1 分钟发一条
-    - 使用 story_memory 做上下文
-    """
-    print("📚【故事模式】后台任务启动")
-
-    while state["story_mode"]["enabled"]:
-        try:
-            memory = state["story_mode"]["story_memory"][-10:]
-            prompt = "续写刚才的故事，继续讲下一段，保持连贯，至少 120 字。"
-
-            reply = await call_llm_api(prompt, memory)
-
-            # 保存进故事 memory
-            state["story_mode"]["story_memory"].append({"role": "assistant", "text": reply})
-            save_state()
-
-            # 生成 TTS
-            await synthesize_tts(
-                reply,
-                voice="zh-CN-XiaoyiNeural",
-                rate="-5%",
-                pitch="+30Hz"
-            )
-
-            print("📚【故事模式】已生成新的段落")
-
-        except Exception as e:
-            print("❌ 故事生成失败：", e)
-
-        await asyncio.sleep(60)   # 每 1 分钟一段
-
-    print("📕【故事模式】后台任务结束")
 # ---------------------- API: 普通聊天 ----------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
@@ -254,17 +263,13 @@ async def chat_endpoint(
     state["memory"].append({"role": "assistant", "text": reply_text})
     save_state()
 
-    # ---- 后台生成 TTS ----
     async def gen():
-        try:
-            await synthesize_tts(
-                reply_text,
-                voice="zh-CN-XiaoyiNeural",
-                rate="-5%",
-                pitch="+30Hz"
-            )
-        except Exception as e:
-            print("TTS failed:", e)
+        await synthesize_tts(
+            reply_text,
+            voice="zh-CN-XiaoyiNeural",
+            rate="-5%",
+            pitch="+30Hz"
+        )
 
     background_tasks.add_task(gen)
 
@@ -283,23 +288,3 @@ async def tts_endpoint(payload: dict, auth: bool = Depends(check_auth)):
 def get_state(auth: bool = Depends(check_auth)):
     return JSONResponse(state)
 
-
-# ---------------------- 启动事件 ----------------------
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("🚀 Backend Starting...")
-    if state["story_mode"]["enabled"]:
-        print("📚 检测到故事模式开启，自动恢复任务")
-        app.state.story_task = asyncio.create_task(story_loop())
-    yield
-    print("🛑 Backend Stopping...")
-
-# 重新创建 app（带 lifespan）
-app = FastAPI(title="Waifu Backend", lifespan=lifespan)
-
-# 重新注册路由（必须保持）
-app.post("/chat", response_model=ChatResponse)(chat_endpoint)
-app.post("/tts")(tts_endpoint)
-app.get("/state")(get_state)
