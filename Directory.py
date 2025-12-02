@@ -152,10 +152,7 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
 
 
 
-         当前时间：{datetime.now().strftime("%Y年%m月%d日 %H:%M")}
-
-         最近的对话：
-         {最近记忆}
+         
 
          请基于以上对话历史进行回复，回复必须超过100字，尽量详细、丰富，连贯自然。"""
 
