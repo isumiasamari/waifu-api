@@ -52,7 +52,10 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 tts_lock = asyncio.Lock()
 
 # ---------------------- FastAPI ----------------------
-app = FastAPI(title="Waifu Backend (Edge-TTS + DeepSeek)")
+app = FastAPI(
+    title="Waifu Backend",
+    lifespan=lifespan
+)
 security = HTTPBearer(auto_error=False)
 
 # 在 FastAPI 中保存故事任务，不要用 global
@@ -72,9 +75,10 @@ state = {
     "character": {"name": "麻毬", "age": 18, "seikaku": "温柔"},
     "memory": [],
     "story_mode": {
-        "enabled": False,
-        "last_reply": None,
-        "last_time": None,
+    "enabled": False,
+    "last_reply": None,
+    "last_time": None,
+    "story_memory": []   # ★ 必须加
     }
 }
 
