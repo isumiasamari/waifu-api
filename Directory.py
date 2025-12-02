@@ -275,7 +275,7 @@ async def chat_endpoint(
     msg = req.message.strip()
 
     # ===== 特殊命令 =====
-    if msg == "爱你":
+    if msg == "开始":
         state["story_mode"]["enabled"] = True
         save_state()
 
