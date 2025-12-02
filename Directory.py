@@ -73,8 +73,8 @@ state = {
     "memory": [],
     "story_mode": {
         "enabled": False,
-        "story_memory": [],
-        "pending_messages": []
+        "last_reply": None,
+        "last_time": None,
     }
 }
 
