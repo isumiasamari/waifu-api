@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
-
+import httpx
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, JSONResponse
@@ -28,6 +28,7 @@ load_dotenv()
 # 获取 API 密钥
 APP_API_TOKEN = os.getenv("APP_API_TOKEN", "please-change-me")
 API_KEY = os.getenv("API_KEY")
+TTS_PROXY_URL = os.getenv("TTS_PROXY_URL", "").strip() or None
 
 print(f"🔐 APP_API_TOKEN: {'已设置' if APP_API_TOKEN and APP_API_TOKEN != 'please-change-me' else '未设置'}")
 print(f"🔐 API_KEY: {'已设置' if API_KEY else '未设置'}")
@@ -151,38 +152,49 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
 
 # ---------------------- Edge-TTS 生成 ----------------------
 async def synthesize_tts(text: str, voice: str = "zh-CN-XiaoyouNeural") -> Path:
+    """
+    优先走 TTS 代理（你的电脑），如果没配置 TTS_PROXY_URL，就退回本地 edge_tts（方便你在本机跑）
+    """
     async with tts_lock:
-        # 确保目录存在（Render 这种云环境默认是没有这个目录的）
-        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-
         timestamp = int(time.time() * 1000)
         filename = f"reply_{timestamp}.mp3"
         dest = AUDIO_DIR / filename
 
-        communicate = edge_tts.Communicate(text=text, voice=voice)
+        # ---------- 1. 云端：优先用代理 ----------
+        if TTS_PROXY_URL:
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        TTS_PROXY_URL,
+                        json={"text": text},
+                    )
 
-        try:
-            # 这里如果云端拿不到音频，就会抛 NoAudioReceived
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"TTS 代理状态码 {resp.status_code}: {resp.text[:200]}"
+                    )
+
+                # 把代理返回的 mp3 二进制写进文件
+                dest.write_bytes(resp.content)
+
+            except Exception as e:
+                # 这里你也可以改成“只提示不报错”，先简单粗暴一点
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"TTS 代理失败: {e}"
+                )
+
+        else:
+            # ---------- 2. 本地开发：没有代理时，继续用 edge_tts ----------
+            communicate = edge_tts.Communicate(text=text, voice=voice)
             await communicate.save(str(dest))
-        except NoAudioReceived:
-            # 不要让整个接口 500，改成 503 + 友好提示
-            raise HTTPException(
-                status_code=503,
-                detail="TTS 服务没有返回音频（云端可能被限制了），先用文字吧。"
-            )
-        except Exception as e:
-            # 兜底异常，方便以后排查
-            raise HTTPException(
-                status_code=500,
-                detail=f"TTS 生成失败: {e}"
-            )
 
-        # 只有成功生成音频时才写 meta
+        # 写 meta
         (dest.with_suffix(".mp3.meta")).write_text(
             json.dumps({"created": datetime.utcnow().isoformat()})
         )
-
         return dest
+
 
 
 # ---------------------- 清理音频 ----------------------
