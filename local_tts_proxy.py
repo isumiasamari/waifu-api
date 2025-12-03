@@ -2,7 +2,7 @@ import os
 import asyncio
 import tempfile
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 import edge_tts
 
@@ -23,12 +23,13 @@ async def tts_proxy(req: TtsProxyRequest):
         raise HTTPException(400, "text 不能为空")
 
     async with tts_lock:
+        tmp_path = None
         try:
-            # 临时 mp3 文件
+            # 创建临时 mp3 文件
             fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
 
-            # 生成 TTS（同步写入）
+            # TTS 生成
             communicate = edge_tts.Communicate(
                 text=req.text,
                 voice=req.voice,
@@ -37,19 +38,23 @@ async def tts_proxy(req: TtsProxyRequest):
             )
             await communicate.save(tmp_path)
 
-            # 返回完整 MP3 文件，不流式传输
-            return FileResponse(
-                tmp_path,
-                media_type="audio/mpeg",
-                filename="tts.mp3",
-                background=None  # FastAPI 4.0 做兼容用
+            # 读取二进制
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+
+            # ⭐ 返回二进制，而不是 FileResponse
+            return Response(
+                content=data,
+                media_type="audio/mpeg"
             )
 
         except Exception as e:
             raise HTTPException(500, f"TTS 失败: {e}")
+
         finally:
-            # 删除临时文件
-            try:
-                os.remove(tmp_path)
-            except:
-                pass
+            # 安全删除文件（如果存在）
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
