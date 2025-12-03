@@ -229,41 +229,67 @@ async def synthesize_tts(
         rate: str = "-5%",
         pitch: str = "+30Hz",
 ) -> Path:
-    async with tts_lock:
-        timestamp = int(time.time() * 1000)
-        filename = f"reply_{timestamp}.mp3"
-        dest = AUDIO_DIR / filename
 
-        if TTS_PROXY_URL:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    TTS_PROXY_URL,
-                    json={
-                        "text": text,
-                        "voice": voice,
-                        "rate": rate,
-                        "pitch": pitch
-                    },
+    # 不建议锁住整个函数，只锁 edge-tts 段
+    timestamp = int(time.time() * 1000)
+    filename = f"reply_{timestamp}.mp3"
+    dest = AUDIO_DIR / filename
+
+    # ----------- 代理模式（推荐你使用）-----------
+    if TTS_PROXY_URL:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # 外层增加真正的超时保护
+                resp = await asyncio.wait_for(
+                    client.post(
+                        TTS_PROXY_URL,
+                        json={
+                            "text": text,
+                            "voice": voice,
+                            "rate": rate,
+                            "pitch": pitch,
+                        }
+                    ),
+                    timeout=12  # 代理最多等待 12 秒
                 )
 
-            if resp.status_code != 200:
-                raise RuntimeError(f"TTS 代理失败: {resp.text[:200]}")
+            if resp.status_code == 200:
+                dest.write_bytes(resp.content)
+                # 写 meta 信息
+                (dest.with_suffix(".mp3.meta")).write_text(
+                    json.dumps({"created": datetime.utcnow().isoformat()})
+                )
+                return dest
+            else:
+                print("⚠️ TTS 代理返回错误，将自动 fallback edge-tts")
 
-            dest.write_bytes(resp.content)
+        except Exception as e:
+            print(f"⚠️ TTS 代理调用失败（自动 fallback）：{e}")
 
-        else:
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice,
-                rate=rate,
-                pitch=pitch
+    # ----------- fallback: edge-tts（永远不会卡死）-----------
+    try:
+        # edge-tts 可能卡住 → 我们加超时
+        async with tts_lock:
+            await asyncio.wait_for(
+                edge_tts.Communicate(
+                    text=text,
+                    voice=voice,
+                    rate=rate,
+                    pitch=pitch
+                ).save(str(dest)),
+                timeout=12  # edge-tts 超时保护
             )
-            await communicate.save(str(dest))
 
-        (dest.with_suffix(".mp3.meta")).write_text(
-            json.dumps({"created": datetime.utcnow().isoformat()})
-        )
-        return dest
+    except asyncio.TimeoutError:
+        raise RuntimeError("edge-tts 超时，语音生成失败")
+    except Exception as e:
+        raise RuntimeError(f"edge-tts 生成失败: {e}")
+
+    # 写 meta
+    (dest.with_suffix(".mp3.meta")).write_text(
+        json.dumps({"created": datetime.utcnow().isoformat()})
+    )
+    return dest
 
 
 # ---------------------- API: 普通聊天 ----------------------
