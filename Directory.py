@@ -11,6 +11,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import edge_tts
@@ -96,31 +97,31 @@ async def story_loop():
             prompt = "和上一段的故事情节保持连贯，至少 120 字。"
             reply = await call_llm_api(prompt, recent_memory)
 
-            # 写入 story_memory
-            state["story_mode"]["story_memory"].append({
-                "role": "assistant",
-                "text": reply
-            })
-            save_state()
-
-            # 尝试生成 TTS
+            # === 生成 TTS（带 audio URL） ===
+            audio_url = None
             try:
-                await synthesize_tts(
+                audio_path = await synthesize_tts(
                     reply,
                     voice="zh-CN-XiaoyiNeural",
                     rate="-5%",
                     pitch="+30Hz"
                 )
-                print("📚【故事模式】已生成下一段")
-
+                audio_url = f"/audio/{audio_path.name}"
+                print("📚【故事模式】已生成下一段 + 语音")
             except Exception as tts_err:
-                # B 策略：忽略 TTS 错误，继续下一段
-                print("⚠️【故事模式】TTS 失败，跳过这一段：", tts_err)
+                print("⚠️【故事模式】TTS 失败，跳过语音：", tts_err)
+
+            # === 只 append 一次！带 audio 的版本 ===
+            state["story_mode"]["story_memory"].append({
+                "role": "assistant",
+                "text": reply,
+                "audio": audio_url
+            })
+            save_state()
 
         except Exception as e:
             print("❌ 故事模式内部错误：", e)
 
-        # 无论成功失败，都等待 60 秒继续下一段
         await asyncio.sleep(60)
 
     print("📕【故事模式】后台任务结束")
@@ -143,7 +144,7 @@ app = FastAPI(
     title="Waifu Backend",
     lifespan=lifespan
 )
-
+app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 security = HTTPBearer(auto_error=False)
 
 # 在 FastAPI 中保存故事任务，不要用 global
@@ -153,6 +154,7 @@ from pydantic import BaseModel
 
 class StoryChunk(BaseModel):
     text: str
+    audio: Optional[str] = None
 
 # ---------------------- 数据模型 ----------------------
 class ChatRequest(BaseModel):
@@ -177,8 +179,13 @@ async def get_latest_story(auth: bool = Depends(check_auth)):
     story = state.get("story_mode", {}).get("story_memory", [])
     if not story:
         raise HTTPException(404, "还没有故事哦~")
-    # 返回最后一段故事文本
-    return StoryChunk(text=story[-1]["text"])
+
+    latest = story[-1]
+
+    return StoryChunk(
+        text=latest.get("text", ""),
+        audio=latest.get("audio")  # 可能是 None
+    )
 
 
 # ---------------------- 调用 DeepSeek ----------------------
