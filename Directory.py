@@ -327,15 +327,6 @@ async def chat_endpoint(
     state["memory"].append({"role": "assistant", "text": reply_text})
     save_state()
 
-    async def gen():
-        await synthesize_tts(
-            reply_text,
-            voice="zh-CN-XiaoyiNeural",
-            rate="-5%",
-            pitch="+30Hz"
-        )
-
-    background_tasks.add_task(gen)
 
     return ChatResponse(reply=reply_text, tts_url=None)
 
