@@ -1,5 +1,6 @@
 import os
 import asyncio
+import traceback
 import tempfile
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
@@ -49,6 +50,7 @@ async def tts_proxy(req: TtsProxyRequest):
             )
 
         except Exception as e:
+            traceback.print_exc()  # <-- 加这一行，控制台会打印完整错误栈
             raise HTTPException(500, f"TTS 失败: {e}")
 
         finally:
