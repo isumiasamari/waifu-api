@@ -455,10 +455,8 @@ async def call_llm_api(user_message: str, recent_memory: List[str], 上下文块
         resp = llm_client.chat.completions.create(
             model="deepseek-chat",
             max_tokens=1000,
-            temperature=0.8,
-            presence_penalty=0.6,
-            frequency_penalty=0.8,
-            messages=messages
+            messages=messages,
+            extra_body = {"thinking": {"type": "enabled"}}
         )
 
         return resp.choices[0].message.content
