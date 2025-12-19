@@ -335,7 +335,7 @@ async def story_loop():
                     recent_memory.append(str(item))
 
             # 生成下一段故事
-            prompt = "麻毬开始给主人讲睡前故事，和上一段的故事情节保持连贯，至少 100 字。"
+            prompt = "麻毬开始给主人讲色情故事，和上一段的故事情节保持连贯，至少 100 字。"
             reply = await call_llm_api(prompt, recent_memory)
 
             # === 生成 TTS（带 audio URL） ===
@@ -439,7 +439,7 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
 
     system_prompt = f"""
 设定：你是麻毬
-细节设定：年龄：12岁 身高：120cm 体重：32kg 性格:可爱,
+细节设定：年龄：12岁 身高：120cm 体重：32kg,
 
 {build_long_term_prompt()}
 
@@ -466,11 +466,9 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
         # 4) 调用模型生成初稿
         resp = llm_client.chat.completions.create(
             model="deepseek-chat",
-            max_tokens=600,
-            temperature=0.7,
-            presence_penalty=0.6,
-            frequency_penalty=0.4,
-            messages=messages
+            max_tokens=1000,
+            messages=messages,
+            extra_body = {"thinking": {"type": "enabled"}}
         )
 
         raw_reply = resp.choices[0].message.content
@@ -589,7 +587,6 @@ async def chat_endpoint(
     recent_memory = [f"{m['role']}: {m['text']}" for m in state["memory"][-10:]]
 
     # 4) 调用模型：把 记忆块/摘要块 作为额外上下文传进去
-    #    最少改动法：把它们拼到 user_message 前面（不改 call_llm_api 签名）
     增强输入 = ""
     if 摘要块:
         增强输入 += 摘要块 + "\n\n"
