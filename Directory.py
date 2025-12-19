@@ -204,10 +204,6 @@ def 取会话最近消息(用户ID: str, 会话ID: str, 条数: int = 30) -> Lis
     return [{"id": int(r["id"]), "角色": r["角色"], "文本": r["文本"]} for r in rows]
 
 async def 生成会话摘要_L1(用户ID: str, 会话ID: str, 条数: int = 30) -> None:
-    """
-    触发时，把最近 N 条消息发给 LLM，让它生成结构化摘要（建议 JSON）。
-    你 token 紧张的话，把频率调低即可。
-    """
     消息 = 取会话最近消息(用户ID, 会话ID, 条数=条数)
     if not 消息:
         return
@@ -215,27 +211,35 @@ async def 生成会话摘要_L1(用户ID: str, 会话ID: str, 条数: int = 30) 
     覆盖起始 = 消息[0]["id"]
     覆盖结束 = 消息[-1]["id"]
 
-    # 给模型的输入尽量短
-    对话文本 = "\n".join([f'{m["角色"]}: {m["文本"]}' for m in 消息])
+    主人名 = "主人"
+    角色名 = state.get("character", {}).get("name", "麻毬")  # 默认麻毬
+
+    def 角色映射(role: str) -> str:
+        if role == "user":
+            return 主人名
+        if role == "assistant":
+            return 角色名
+        return role  # 兜底
+
+    # 让输入对话就已经是“主人/麻毬”
+    对话文本 = "\n".join([f'{角色映射(m["角色"])}: {m["文本"]}' for m in 消息])
 
     摘要提示 = f"""
 请把下面对话生成【结构化摘要】（必须是 JSON），只保留两个字段：
 - facts: 稳定事实/长期有效信息（尽量短，去重，不确定就不要写）
 - decisions: 已确定的决定/约定/行动项（含时间/条件；没有就给空数组）
 
-输出格式示例：
-{
-  "facts": ["..."],
-  "decisions": ["..."]
-}
+强制要求：
+1) 在输出的 facts/decisions 里，只使用“{主人名}”和“{角色名}”来指代说话者；
+   不要使用“用户/角色/助手/我/你”等称呼（除非出现在原文引用里）。
+2) 输出必须严格是 JSON，不要包含任何额外文字。
+示例：{{"facts":["..."],"decisions":["..."]}}
 
-要求：短、准、不编造；没有就输出空数组。
 对话：
 {对话文本}
 """.strip()
 
-    # 复用你现有的 call_llm_api（它会带 system prompt 和角色设定）
-    摘要文本 = await call_llm_api(摘要提示, recent_memory=[])
+    摘要文本 = await call_llm_api(摘要提示, recent_memory=[], 上下文块="")
 
     with 连接记忆库() as 连接:
         连接.execute(
@@ -414,36 +418,40 @@ async def get_latest_story(auth: bool = Depends(check_auth)):
 
 
 # ---------------------- 调用 DeepSeek ----------------------
-async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
+async def call_llm_api(user_message: str, recent_memory: List[str], 上下文块: str = "") -> str:
     if not llm_client:
         return "抱歉，AI 暂不可用。"
 
     system_prompt = f"""
 {系统固定}
 
-
-
 当前时间是：{datetime.now().strftime("%Y年%m月%d日 %H:%M")}
 """.strip()
 
     try:
-        # 1) 先组 messages（注意：recent_memory 这个参数你现在没用到也没问题，先保留不动）
+        # 1) system 固定指令
         messages = [{"role": "system", "content": system_prompt}]
 
-        # 2) 把最近对话作为 history（不是规则）
-        for m in state["memory"][-10:]:
+        # 2) 插入：检索到的摘要/记忆块（作为 system 上下文）
+        if 上下文块 and 上下文块.strip():
+            messages.append({
+                "role": "system",
+                "content": 上下文块.strip()
+            })
+
+        # 3) 最近对话历史（真实 user/assistant）
+        for m in state["memory"][-6:]:
             messages.append({
                 "role": m["role"],       # "user" 或 "assistant"
                 "content": m["text"]
             })
 
-        # 3) 再加上本轮用户输入
+        # 4) 本轮用户输入（只放当前输入，不再混摘要/记忆）
         messages.append({
             "role": "user",
             "content": user_message
         })
 
-        # 4) 调用模型生成初稿
         resp = llm_client.chat.completions.create(
             model="deepseek-chat",
             max_tokens=1000,
@@ -453,12 +461,12 @@ async def call_llm_api(user_message: str, recent_memory: List[str]) -> str:
             messages=messages
         )
 
-        raw_reply = resp.choices[0].message.content
-        return raw_reply
+        return resp.choices[0].message.content
 
     except Exception as e:
         print("❌ LLM 调用失败:", e)
         return "抱歉，我有点头晕……先休息一下~"
+
 
 # ---------------------- Edge-TTS 生成 ----------------------
 async def synthesize_tts(
@@ -559,7 +567,7 @@ async def chat_endpoint(
     )
 
     # 3) 会话摘要（可选）：把最近摘要也塞进去（更省 token）
-    摘要块 = 取最近会话摘要(用户ID, 会话ID, 条数=2)
+    摘要块 = 取最近会话摘要(用户ID, 会话ID, 条数=3)
 
     # 你原来的短期 memory 仍然保留
     state["memory"].append({"role": "user", "text": msg})
@@ -569,14 +577,13 @@ async def chat_endpoint(
     recent_memory = [f"{m['role']}: {m['text']}" for m in state["memory"][-10:]]
 
     # 4) 调用模型：把 记忆块/摘要块 作为额外上下文传进去
-    增强输入 = ""
+    上下文块 = ""
     if 摘要块:
-        增强输入 += 摘要块 + "\n\n"
+        上下文块 += "【会话摘要】\n" + 摘要块 + "\n\n"
     if 记忆块:
-        增强输入 += 记忆块 + "\n\n"
-    增强输入 += "当前用户输入：\n" + msg
+        上下文块 += "【相关历史片段】\n" + 记忆块 + "\n\n"
 
-    reply_text = await call_llm_api(增强输入, recent_memory)
+    reply_text = await call_llm_api(msg, recent_memory, 上下文块=上下文块)
 
     # 5) 写入 assistant
     写入消息(用户ID, 会话ID, "assistant", reply_text, int(time.time() * 1000))
@@ -587,9 +594,9 @@ async def chat_endpoint(
     # 6) 摘要触发（最简单：达到阈值就生成一次 L1）
     #    你 token 紧张可把阈值调大；或改成后台 task
     会话消息数 = 统计会话消息数量(用户ID, 会话ID)
-    if 会话消息数 % 30 == 0:  # 每 30 条生成一次
+    if 会话消息数 % 20 == 0:  # 每 20 条生成一次
         # 用后台任务更好，不阻塞主回复
-        background_tasks.add_task(生成会话摘要_L1, 用户ID, 会话ID, 30)
+        background_tasks.add_task(生成会话摘要_L1, 用户ID, 会话ID, 20)
 
     return ChatResponse(reply=reply_text, tts_url=None)
 
