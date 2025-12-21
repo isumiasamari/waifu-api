@@ -606,22 +606,24 @@ async def call_llm_api(user_message: str, recent_memory: List[str], 上下文块
                 "content": 上下文块.strip()
             })
 
-        # 3) 最近对话历史（优先使用 recent_memory，避免直接读 state["memory"] 造成重复）
-        # recent_memory 形如 ["user: ...", "assistant: ..."]
-        for line in (recent_memory or [])[-7:]:
-            if ":" not in line:
-                continue
-            role, content = line.split(":", 1)
-            role = role.strip()
-            content = content.strip()
-            if role not in ("user", "assistant"):
-                continue
-            messages.append({"role": role, "content": content})
+        # 3) 最近对话历史（真实 user/assistant）
+        历史 = state["memory"][-6:]
 
-        # 4) 本轮用户输入：如果 recent_memory 的最后一条已经是同一句 user，则不再重复 append
-        if not (recent_memory and recent_memory[-1].startswith("user:") and recent_memory[-1][
-            5:].strip() == user_message.strip()):
-            messages.append({"role": "user", "content": user_message})
+        # ✅ 防重复：如果历史最后一条就是“本轮 user_message”，就不要再喂一次
+        if 历史 and 历史[-1].get("role") == "user" and 历史[-1].get("text", "").strip() == user_message.strip():
+            历史 = 历史[:-1]
+
+        for m in 历史:
+            messages.append({
+                "role": m["role"],  # "user" 或 "assistant"
+                "content": m["text"]
+            })
+
+        # 4) 本轮用户输入（永远追加一次）
+        messages.append({
+            "role": "user",
+            "content": user_message
+        })
 
         # ✅【插在这里：组好 messages 之后、create 之前】
         日志文件 = 写入_llm_请求日志(
@@ -714,6 +716,7 @@ async def chat_endpoint(
         save_state()
         return ChatResponse(reply="已经停下故事了~", tts_url=None)
 
+
     if msg == "继续":
         state["story_mode"]["enabled"] = True
         save_state()
@@ -731,6 +734,11 @@ async def chat_endpoint(
         会话ID = str(int(time.time()))
         state["current_session_id"] = 会话ID
         save_state()
+
+    # ✅ 插在这里：手动触发生成摘要（在写入消息之前）
+    if msg == "生成摘要":
+        await 生成会话摘要_L1(用户ID, 会话ID, 20)
+        return ChatResponse(reply="已生成摘要", tts_url=None)
 
     # 1) 写入 user（拿到当前消息ID，后面用于排除“召回自己”）
     时间戳毫秒 = int(time.time() * 1000)
