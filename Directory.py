@@ -620,21 +620,23 @@ async def call_llm_api(user_message: str, recent_memory: List[str], 上下文块
         # 3) 最近对话历史（真实 user/assistant）
         历史 = state["memory"][-6:]
 
-        # ✅ 防重复：如果历史最后一条就是“本轮 user_message”，就不要再喂一次
-        if 历史 and 历史[-1].get("role") == "user" and 历史[-1].get("text", "").strip() == user_message.strip():
-            历史 = 历史[:-1]
+        # ✅ 强兜底：移除历史中任何与本轮 user_message 完全相同的 user（不只最后一条）
+        def _取文本(m):
+            return (m.get("text") if "text" in m else m.get("content", "")) or ""
+
+        历史 = [
+            m for m in 历史
+            if not (m.get("role") == "user" and _取文本(m).strip() == user_message.strip())
+        ]
 
         for m in 历史:
             messages.append({
-                "role": m["role"],  # "user" 或 "assistant"
-                "content": m["text"]
+                "role": m["role"],
+                "content": _取文本(m)
             })
 
         # 4) 本轮用户输入（永远追加一次）
-        messages.append({
-            "role": "user",
-            "content": user_message
-        })
+        messages.append({"role": "user", "content": user_message})
 
         # ✅【插在这里：组好 messages 之后、create 之前】
         日志文件 = 写入_llm_请求日志(
