@@ -807,6 +807,9 @@ async def chat_endpoint(
     if 新增未摘要条数 >= 20:
         background_tasks.add_task(生成会话摘要_L1, 用户ID, 会话ID, 20)
 
+    return ChatResponse(reply=reply_text, tts_url=None)
+
+
 
 # ---------------------- 其他 API ----------------------
 @app.post("/tts")
