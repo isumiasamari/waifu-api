@@ -4,6 +4,7 @@ import uuid
 import json
 import asyncio
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -18,6 +19,7 @@ import edge_tts
 from contextlib import asynccontextmanager
 import sqlite3
 from typing import List, Dict, Any, Optional, Tuple
+import hashlib
 
 
 
@@ -91,6 +93,53 @@ def 写入_llm_请求日志(用户ID: str, 会话ID: str, messages: List[Dict[st
 
     文件路径.write_text(json.dumps(记录, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(文件路径)
+
+停用 = {"不行", "不能", "这个", "那个", "然后", "但是", "因为"}  # 你可以自行扩充
+
+
+
+def 构造_fts5_查询串(原句: str, max_terms: int = 12) -> str:
+    """
+    把用户原句转换为 FTS5 查询表达式（term1 OR term2 OR ...）。
+    适配 trigram tokenizer：用 2~4 字中文片段 + 英文/数字词。
+    """
+    s = (原句 or "").strip()
+    # 只保留中文/字母/数字，其他都替换为空格
+    s = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    chunks = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", s)
+
+    terms: List[str] = []
+
+    for c in chunks:
+        # 英文/数字：长度>=3才有意义
+        if re.fullmatch(r"[A-Za-z0-9]+", c):
+            if len(c) >= 3:
+                terms.append(c)
+            continue
+
+        # 中文：生成 2~4 字片段
+        L = len(c)
+        for n in (2, 3, 4):
+            if L >= n:
+                for i in range(0, L - n + 1):
+                    terms.append(c[i:i + n])
+
+    # 去重 + 截断
+    out: List[str] = []
+    seen = set()
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= max_terms:
+            break
+
+    # OR 查询：召回包含任一片段的历史消息
+    return " OR ".join(out)
 # ========== 长期记忆：SQLite + FTS5 ==========
 记忆库路径 = DATA_DIR / "记忆.db"
 
@@ -159,41 +208,114 @@ def 初始化记忆库():
         """)
 
 
-def 写入消息(用户ID: str, 会话ID: str, 角色: str, 文本: str, 时间戳毫秒: int) -> int:
-    with 连接记忆库() as 连接:
-        游标 = 连接.execute(
-            "INSERT INTO 原始消息(用户ID, 会话ID, 时间戳, 角色, 文本) VALUES (?, ?, ?, ?, ?)",
-            (用户ID, 会话ID, 时间戳毫秒, 角色, 文本)
-        )
-        消息ID = int(游标.lastrowid)
+def _去重键(角色: str, 文本: str, 客户端消息ID: Optional[str] = None) -> str:
+    """
+    去重键优先使用客户端提供的 client_msg_id（最稳），否则退化为 role+text 的 hash。
+    单用户场景可用；多用户时建议把用户ID也拼进去。
+    """
+    base = 客户端消息ID or f"{角色}:{文本}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
+
+def 写入消息(
+    用户ID: str,             # 你现有签名保留，不用也行
+    会话ID: str,
+    角色: str,
+    文本: str,
+    时间戳毫秒: int,
+    客户端消息ID: Optional[str] = None
+) -> int:
+    """
+    幂等写入：同一条消息（同会话、同角色、同去重键）重复提交不会重复入库。
+    同时维护 FTS（全文索引）使用 rowid=原始消息.id。
+    """
+    去重 = _去重键(角色, 文本, 客户端消息ID)
+
+    with 连接记忆库() as 连接:
+        连接.row_factory = sqlite3.Row
+
+        # 1) 原始消息：幂等写入
         连接.execute(
-            "INSERT INTO 全文索引(message_id, 用户ID, 会话ID, 文本) VALUES (?, ?, ?, ?)",
+            """
+            INSERT OR IGNORE INTO 原始消息(用户ID, 会话ID, 时间戳, 角色, 文本, 去重键)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (用户ID, 会话ID, 时间戳毫秒, 角色, 文本, 去重)
+        )
+
+        # 2) 取实际消息ID（无论是新插入还是被忽略）
+        row = 连接.execute(
+            "SELECT id FROM 原始消息 WHERE 会话ID=? AND 角色=? AND 去重键=?",
+            (会话ID, 角色, 去重)
+        ).fetchone()
+        消息ID = int(row["id"])
+
+        # 3) FTS：使用 rowid 映射原始消息.id（外部内容表模式下建议这样维护）
+        #    先删再插，确保幂等
+        连接.execute("DELETE FROM 全文索引 WHERE rowid=?", (消息ID,))
+        连接.execute(
+            "INSERT INTO 全文索引(rowid, 用户ID, 会话ID, 文本) VALUES (?, ?, ?, ?)",
             (消息ID, 用户ID, 会话ID, 文本)
         )
+
         return 消息ID
 
 def 检索记忆_按时间顺序(
     用户ID: str,
     会话ID: Optional[str],
     查询文本: str,
+    当前消息ID: int,              # 必须：用于排除当前消息（避免把自己召回）
     命中条数: int = 12,
-    最多字符: int = 1800
+    最多字符: int = 1800,
+    最短检索长度: int = 12,        # 可调：短句不做长期记忆检索，减少噪声
 ) -> str:
     """
-    用 FTS5 按关键词召回消息，再回表取原文，最后按时间戳升序组装成记忆块。
+    用 FTS5 (trigram) 按关键词召回消息，再回表取原文，最后按时间戳升序组装成记忆块。
     会话ID 为 None 时表示跨会话检索。
+
+    注意：
+    - 调用方传入“用户原句”即可，不要额外加引号（不要 f'"{msg}"'）。
+    - 本函数内部会将原句转换为 FTS5 查询表达式（查询串）。
     """
+
+    # 1) 短句直接跳过长期记忆检索（可选但推荐）
+    原句 = (查询文本 or "").strip()
+    if len(原句) < 最短检索长度:
+        return ""
+
+    # 2) 原句 -> 查询串（FTS5 查询表达式）
+    查询串 = 构造_fts5_查询串(原句)
+    if not 查询串:
+        return ""
+
     with 连接记忆库() as 连接:
+        # 确保能通过列名访问 row["message_id"]
+        if getattr(连接, "row_factory", None) is None:
+            连接.row_factory = sqlite3.Row
+
         if 会话ID:
             命中 = 连接.execute(
-                "SELECT message_id FROM 全文索引 WHERE 用户ID=? AND 会话ID=? AND 全文索引 MATCH ? LIMIT ?",
-                (用户ID, 会话ID, 查询文本, 命中条数)
+                """
+                SELECT rowid AS message_id
+                FROM 全文索引
+                WHERE 用户ID=? AND 会话ID=? AND 全文索引 MATCH ?
+                  AND rowid <> ?
+                ORDER BY bm25(全文索引)
+                LIMIT ?
+                """,
+                (用户ID, 会话ID, 查询串, 当前消息ID, 命中条数)
             ).fetchall()
         else:
             命中 = 连接.execute(
-                "SELECT message_id FROM 全文索引 WHERE 用户ID=? AND 全文索引 MATCH ? LIMIT ?",
-                (用户ID, 查询文本, 命中条数)
+                """
+                SELECT rowid AS message_id
+                FROM 全文索引
+                WHERE 用户ID=? AND 全文索引 MATCH ?
+                  AND rowid <> ?
+                ORDER BY bm25(全文索引)
+                LIMIT ?
+                """,
+                (用户ID, 查询串, 当前消息ID, 命中条数)
             ).fetchall()
 
         命中ID列表 = [int(r["message_id"]) for r in 命中]
@@ -202,17 +324,21 @@ def 检索记忆_按时间顺序(
 
         占位符 = ",".join(["?"] * len(命中ID列表))
         行 = 连接.execute(
-            f"SELECT id, 时间戳, 角色, 文本 FROM 原始消息 WHERE id IN ({占位符}) ORDER BY 时间戳 ASC",
+            f"""
+            SELECT id, 时间戳, 角色, 文本
+            FROM 原始消息
+            WHERE id IN ({占位符})
+            ORDER BY 时间戳 ASC
+            """,
             tuple(命中ID列表)
         ).fetchall()
 
-    # 组装记忆块：按时间顺序，限字符
+    # 3) 组装记忆块：按时间顺序，限字符
     片段: List[str] = []
     已用 = 0
     for r in 行:
-        # 时间戳这里用毫秒；显示给模型可以只给日期时间字符串或省略
-        角色 = r["角色"]
-        文本 = r["文本"].strip().replace("\n", " ")
+        角色 = (r["角色"] or "").strip()
+        文本 = (r["文本"] or "").strip().replace("\n", " ")
         行文本 = f"{角色}: {文本}"
         if 已用 + len(行文本) > 最多字符:
             break
@@ -243,6 +369,8 @@ def 取会话最近消息(用户ID: str, 会话ID: str, 条数: int = 30) -> Lis
 
 async def 生成会话摘要_L1(用户ID: str, 会话ID: str, 条数: int = 30) -> None:
     消息 = 取会话最近消息(用户ID, 会话ID, 条数=条数)
+    if len(消息) >= 1:
+        消息 = 消息[:-1]
     if not 消息:
         return
 
@@ -478,18 +606,22 @@ async def call_llm_api(user_message: str, recent_memory: List[str], 上下文块
                 "content": 上下文块.strip()
             })
 
-        # 3) 最近对话历史（真实 user/assistant）
-        for m in state["memory"][-6:]:
-            messages.append({
-                "role": m["role"],       # "user" 或 "assistant"
-                "content": m["text"]
-            })
+        # 3) 最近对话历史（优先使用 recent_memory，避免直接读 state["memory"] 造成重复）
+        # recent_memory 形如 ["user: ...", "assistant: ..."]
+        for line in (recent_memory or [])[-7:]:
+            if ":" not in line:
+                continue
+            role, content = line.split(":", 1)
+            role = role.strip()
+            content = content.strip()
+            if role not in ("user", "assistant"):
+                continue
+            messages.append({"role": role, "content": content})
 
-        # 4) 本轮用户输入（只放当前输入，不再混摘要/记忆）
-        messages.append({
-            "role": "user",
-            "content": user_message
-        })
+        # 4) 本轮用户输入：如果 recent_memory 的最后一条已经是同一句 user，则不再重复 append
+        if not (recent_memory and recent_memory[-1].startswith("user:") and recent_memory[-1][
+            5:].strip() == user_message.strip()):
+            messages.append({"role": "user", "content": user_message})
 
         # ✅【插在这里：组好 messages 之后、create 之前】
         日志文件 = 写入_llm_请求日志(
@@ -600,30 +732,30 @@ async def chat_endpoint(
         state["current_session_id"] = 会话ID
         save_state()
 
-    # 1) 写入 L0 + FTS
+    # 1) 写入 user（拿到当前消息ID，后面用于排除“召回自己”）
     时间戳毫秒 = int(time.time() * 1000)
-    写入消息(用户ID, 会话ID, "user", msg, 时间戳毫秒)
+    当前用户消息ID = 写入消息(用户ID, 会话ID, "user", msg, 时间戳毫秒)
 
-    # 2) 关键词检索：按时间顺序拿到记忆块（跨会话的话把会话ID传 None）
+    # 2) 长期记忆召回（排除当前消息）
     记忆块 = 检索记忆_按时间顺序(
         用户ID=用户ID,
-        会话ID=None,  # 想只检索当前会话就改成 会话ID
-        查询文本=f'"{msg}"',
+        会话ID=None,
+        查询文本=msg,
+        当前消息ID=当前用户消息ID,
         命中条数=12,
         最多字符=1600
     )
 
-    # 3) 会话摘要（可选）：把最近摘要也塞进去（更省 token）
+    # 3) 会话摘要
     摘要块 = 取最近会话摘要(用户ID, 会话ID, 条数=3)
 
-    # 你原来的短期 memory 仍然保留
-    state["memory"].append({"role": "user", "text": msg})
-    state["memory"] = state["memory"][-MAX_MEMORY:]
-    save_state()
+    # 4) 仍然保留 recent_memory 的构造（不要删）
+    #    注意：这里不写入 state["memory"]，只构造一个“用于本轮提示”的 recent_memory
+    临时短期 = (state["memory"][-(MAX_MEMORY - 1):] if MAX_MEMORY > 1 else state["memory"][:])
+    临时短期 = 临时短期 + [{"role": "user", "text": msg}]  # 仅用于 recent_memory
+    recent_memory = [f"{m['role']}: {m['text']}" for m in 临时短期[-10:]]
 
-    recent_memory = [f"{m['role']}: {m['text']}" for m in state["memory"][-10:]]
-
-    # 4) 调用模型：把 记忆块/摘要块 作为额外上下文传进去
+    # 5) 上下文块
     上下文块 = ""
     if 摘要块:
         上下文块 += "【会话摘要】\n" + 摘要块 + "\n\n"
@@ -638,17 +770,18 @@ async def chat_endpoint(
         会话ID=会话ID
     )
 
-    # 5) 写入 assistant
+    # 6) 写入 assistant（也可用去重，但一般不必）
     写入消息(用户ID, 会话ID, "assistant", reply_text, int(time.time() * 1000))
 
+    # 7) 现在再把本轮对话写入 state["memory"]（避免本轮入参重复）
+    state["memory"].append({"role": "user", "text": msg})
     state["memory"].append({"role": "assistant", "text": reply_text})
+    state["memory"] = state["memory"][-MAX_MEMORY:]
     save_state()
 
-    # 6) 摘要触发（最简单：达到阈值就生成一次 L1）
-    #    你 token 紧张可把阈值调大；或改成后台 task
+    # 8) 摘要触发
     会话消息数 = 统计会话消息数量(用户ID, 会话ID)
-    if 会话消息数 % 20 == 0:  # 每 20 条生成一次
-        # 用后台任务更好，不阻塞主回复
+    if 会话消息数 % 20 == 0:
         background_tasks.add_task(生成会话摘要_L1, 用户ID, 会话ID, 20)
 
     return ChatResponse(reply=reply_text, tts_url=None)
