@@ -237,23 +237,18 @@ def _去重键(角色: str, 文本: str, 客户端消息ID: Optional[str] = None
 
 
 def 写入消息(
-    用户ID: str,             # 你现有签名保留，不用也行
+    用户ID: str,
     会话ID: str,
     角色: str,
     文本: str,
     时间戳毫秒: int,
     客户端消息ID: Optional[str] = None
 ) -> int:
-    """
-    幂等写入：同一条消息（同会话、同角色、同去重键）重复提交不会重复入库。
-    同时维护 FTS（全文索引）使用 rowid=原始消息.id。
-    """
     去重 = _去重键(角色, 文本, 客户端消息ID)
 
     with 连接记忆库() as 连接:
         连接.row_factory = sqlite3.Row
 
-        # 1) 原始消息：幂等写入
         连接.execute(
             """
             INSERT OR IGNORE INTO 原始消息(用户ID, 会话ID, 时间戳, 角色, 文本, 去重键)
@@ -262,18 +257,18 @@ def 写入消息(
             (用户ID, 会话ID, 时间戳毫秒, 角色, 文本, 去重)
         )
 
-        # 2) 取实际消息ID（无论是新插入还是被忽略）
         row = 连接.execute(
             "SELECT id FROM 原始消息 WHERE 会话ID=? AND 角色=? AND 去重键=?",
             (会话ID, 角色, 去重)
         ).fetchone()
         消息ID = int(row["id"])
 
-        # 3) FTS：使用 rowid 映射原始消息.id（外部内容表模式下建议这样维护）
-        #    先删再插，确保幂等
-        连接.execute("DELETE FROM 全文索引 WHERE rowid=?", (消息ID,))
+        # ✅ contentless FTS：只需保证 message_id 对应即可
         连接.execute(
-            "INSERT INTO 全文索引(rowid, 用户ID, 会话ID, 文本) VALUES (?, ?, ?, ?)",
+            """
+            INSERT OR REPLACE INTO 全文索引(message_id, 用户ID, 会话ID, 文本)
+            VALUES (?, ?, ?, ?)
+            """,
             (消息ID, 用户ID, 会话ID, 文本)
         )
 
@@ -283,42 +278,24 @@ def 检索记忆_按时间顺序(
     用户ID: str,
     会话ID: Optional[str],
     查询文本: str,
-    当前消息ID: int,              # 必须：用于排除当前消息（避免把自己召回）
+    当前消息ID: int,
     命中条数: int = 12,
-    最多字符: int = 1800,
-    最短检索长度: int = 12,        # 可调：短句不做长期记忆检索，减少噪声
+    最多字符: int = 1800
 ) -> str:
-    """
-    用 FTS5 (trigram) 按关键词召回消息，再回表取原文，最后按时间戳升序组装成记忆块。
-    会话ID 为 None 时表示跨会话检索。
-
-    注意：
-    - 调用方传入“用户原句”即可，不要额外加引号（不要 f'"{msg}"'）。
-    - 本函数内部会将原句转换为 FTS5 查询表达式（查询串）。
-    """
-
-    # 1) 短句直接跳过长期记忆检索（可选但推荐）
-    原句 = (查询文本 or "").strip()
-    if len(原句) < 最短检索长度:
-        return ""
-
-    # 2) 原句 -> 查询串（FTS5 查询表达式）
-    查询串 = 构造_fts5_查询串(原句)
+    查询串 = 构造_fts5_查询串(查询文本)
     if not 查询串:
         return ""
 
     with 连接记忆库() as 连接:
-        # 确保能通过列名访问 row["message_id"]
-        if getattr(连接, "row_factory", None) is None:
-            连接.row_factory = sqlite3.Row
+        连接.row_factory = sqlite3.Row
 
         if 会话ID:
             命中 = 连接.execute(
                 """
-                SELECT rowid AS message_id
+                SELECT message_id
                 FROM 全文索引
                 WHERE 用户ID=? AND 会话ID=? AND 全文索引 MATCH ?
-                  AND rowid <> ?
+                  AND message_id <> ?
                 ORDER BY bm25(全文索引)
                 LIMIT ?
                 """,
@@ -327,10 +304,10 @@ def 检索记忆_按时间顺序(
         else:
             命中 = 连接.execute(
                 """
-                SELECT rowid AS message_id
+                SELECT message_id
                 FROM 全文索引
                 WHERE 用户ID=? AND 全文索引 MATCH ?
-                  AND rowid <> ?
+                  AND message_id <> ?
                 ORDER BY bm25(全文索引)
                 LIMIT ?
                 """,
@@ -343,20 +320,14 @@ def 检索记忆_按时间顺序(
 
         占位符 = ",".join(["?"] * len(命中ID列表))
         行 = 连接.execute(
-            f"""
-            SELECT id, 时间戳, 角色, 文本
-            FROM 原始消息
-            WHERE id IN ({占位符})
-            ORDER BY 时间戳 ASC
-            """,
+            f"SELECT id, 时间戳, 角色, 文本 FROM 原始消息 WHERE id IN ({占位符}) ORDER BY 时间戳 ASC",
             tuple(命中ID列表)
         ).fetchall()
 
-    # 3) 组装记忆块：按时间顺序，限字符
-    片段: List[str] = []
+    片段 = []
     已用 = 0
     for r in 行:
-        角色 = (r["角色"] or "").strip()
+        角色 = r["角色"]
         文本 = (r["文本"] or "").strip().replace("\n", " ")
         行文本 = f"{角色}: {文本}"
         if 已用 + len(行文本) > 最多字符:
@@ -368,6 +339,7 @@ def 检索记忆_按时间顺序(
         return ""
 
     return "[MEMORY - chronological]\n" + "\n".join(片段)
+
 
 def 统计会话消息数量(用户ID: str, 会话ID: str) -> int:
     with 连接记忆库() as 连接:
