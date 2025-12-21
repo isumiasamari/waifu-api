@@ -69,30 +69,38 @@ def _脱敏(text: str) -> str:
         text = text.replace(k, k[:2] + "***")
     return text
 
-def 写入_llm_请求日志(用户ID: str, 会话ID: str, messages: List[Dict[str, Any]], 文件前缀: str = "llm") -> str:
-    ts = int(time.time() * 1000)
-    文件路径 = 日志目录 / f"{文件前缀}_{用户ID}_{会话ID}_{ts}.jsonl"
+LOG_DIR = "/root/waifu-api/server_data/logs"
 
-    # 控制日志体积：每条 content 截断
-    def _裁剪(msg: Dict[str, Any]) -> Dict[str, Any]:
-        m = dict(msg)
-        c = m.get("content")
-        if isinstance(c, str):
-            c = _脱敏(c)
-            if len(c) > 4000:
-                c = c[:4000] + "\n...【已截断】"
-            m["content"] = c
-        return m
+def 写入_llm_请求日志(
+    会话ID: str,
+    messages: List[Dict[str, Any]],
+    文件前缀: str = "llm",
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    输出真正的 jsonl：每次调用 append 一行 JSON。
+    文件按“会话ID”分文件，方便你按会话追踪。
+    """
+    os.makedirs(LOG_DIR, exist_ok=True)
 
-    记录 = {
-        "ts_ms": ts,
-        "user_id": 用户ID,
+    ts_ms = int(time.time() * 1000)
+    req_id = uuid.uuid4().hex[:12]  # 短一点够用
+
+    path = os.path.join(LOG_DIR, f"{文件前缀}_{会话ID}.jsonl")
+
+    obj = {
+        "ts_ms": ts_ms,
+        "req_id": req_id,
         "session_id": 会话ID,
-        "messages": [_裁剪(m) for m in messages],
+        "messages": messages,
     }
+    if extra:
+        obj["extra"] = extra
 
-    文件路径.write_text(json.dumps(记录, ensure_ascii=False, indent=2), encoding="utf-8")
-    return str(文件路径)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    return path
 
 停用 = {"不行", "不能", "这个", "那个", "然后", "但是", "因为"}  # 你可以自行扩充
 
@@ -640,9 +648,9 @@ async def call_llm_api(user_message: str, recent_memory: List[str], 上下文块
 
         # ✅【插在这里：组好 messages 之后、create 之前】
         日志文件 = 写入_llm_请求日志(
-            用户ID="default_user",
             会话ID=state.get("current_session_id", "unknown"),
-            messages=messages
+            messages=messages,
+            文件前缀="llm"
         )
         print("🧾 LLM最终messages已写入：", 日志文件)
 
