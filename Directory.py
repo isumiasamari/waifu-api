@@ -630,8 +630,8 @@ async def call_llm_api(user_message: str, recent_memory: List[str], 上下文块
             max_tokens=1000,
             messages=messages,
             temperature=0.6,
-            presence_penalty=0.4,
-            frequency_penalty=0.6,
+            presence_penalty=0.1,
+            frequency_penalty=0.5,
         )
 
         return resp.choices[0].message.content
