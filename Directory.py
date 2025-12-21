@@ -140,6 +140,17 @@ def 构造_fts5_查询串(原句: str, max_terms: int = 12) -> str:
 
     # OR 查询：召回包含任一片段的历史消息
     return " OR ".join(out)
+
+
+def 取最后摘要结束ID(用户ID: str, 会话ID: str) -> int:
+    with 连接记忆库() as 连接:
+        r = 连接.execute(
+            "SELECT 覆盖结束消息ID AS end_id FROM 会话摘要 WHERE 用户ID=? AND 会话ID=? ORDER BY 时间戳 DESC LIMIT 1",
+            (用户ID, 会话ID)
+        ).fetchone()
+    return int(r["end_id"]) if r and r["end_id"] else 0
+
+
 # ========== 长期记忆：SQLite + FTS5 ==========
 记忆库路径 = DATA_DIR / "记忆.db"
 
@@ -735,10 +746,6 @@ async def chat_endpoint(
         state["current_session_id"] = 会话ID
         save_state()
 
-    # ✅ 插在这里：手动触发生成摘要（在写入消息之前）
-    if msg == "生成摘要":
-        await 生成会话摘要_L1(用户ID, 会话ID, 20)
-        return ChatResponse(reply="已生成摘要", tts_url=None)
 
     # 1) 写入 user（拿到当前消息ID，后面用于排除“召回自己”）
     时间戳毫秒 = int(time.time() * 1000)
@@ -788,11 +795,17 @@ async def chat_endpoint(
     save_state()
 
     # 8) 摘要触发
-    会话消息数 = 统计会话消息数量(用户ID, 会话ID)
-    if 会话消息数 % 20 == 0:
-        background_tasks.add_task(生成会话摘要_L1, 用户ID, 会话ID, 20)
+    最后结束ID = 取最后摘要结束ID(用户ID, 会话ID)
 
-    return ChatResponse(reply=reply_text, tts_url=None)
+    with 连接记忆库() as 连接:
+        r = 连接.execute(
+            "SELECT COUNT(*) AS c FROM 原始消息 WHERE 用户ID=? AND 会话ID=? AND id > ?",
+            (用户ID, 会话ID, 最后结束ID)
+        ).fetchone()
+    新增未摘要条数 = int(r["c"])
+
+    if 新增未摘要条数 >= 20:
+        background_tasks.add_task(生成会话摘要_L1, 用户ID, 会话ID, 20)
 
 
 # ---------------------- 其他 API ----------------------
